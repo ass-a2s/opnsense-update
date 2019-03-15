@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright (c) 2015-2017 Franco Fichtner <franco@opnsense.org>
+# Copyright (c) 2015-2019 Franco Fichtner <franco@opnsense.org>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -28,27 +28,31 @@
 set -e
 
 if [ "$(id -u)" != "0" ]; then
-	echo "Must be root."
+	echo "Must be root." >&2
 	exit 1
 fi
 
 SIG_KEY="^[[:space:]]*signature_type:[[:space:]]*"
 URL_KEY="^[[:space:]]*url:[[:space:]]*"
-
-ORIGIN="/usr/local/etc/pkg/repos/origin.conf"
 VERSIONDIR="/usr/local/opnsense/version"
 WORKPREFIX="/var/cache/opnsense-update"
-PENDINGDIR="${WORKPREFIX}/.sets.pending"
 OPENSSL="/usr/local/bin/openssl"
-WORKDIR=${WORKPREFIX}/${$}
 DEBUGDIR="/usr/lib/debug"
 KERNELDIR="/boot/kernel"
+TEE="/usr/bin/tee -a"
+PRODUCT="OPNsense"
 PKG="pkg-static"
+VERSION="19.1.4"
+
+ORIGIN="/usr/local/etc/pkg/repos/${PRODUCT}.conf"
+PENDINGDIR="${WORKPREFIX}/.sets.pending"
+PIPEFILE="${WORKPREFIX}/.upgrade.pipe"
+LOGFILE="${WORKPREFIX}/.upgrade.log"
+WORKDIR="${WORKPREFIX}/${$}"
 ARCH=$(uname -p)
-VERSION="17.7.1"
 
 if [ ! -f ${ORIGIN} ]; then
-	echo "Missing origin.conf"
+	echo "Missing ${ORIGIN}" >&2
 	exit 1
 fi
 
@@ -57,9 +61,24 @@ if [ -f ${VERSIONDIR}/base ]; then
 	INSTALLED_BASE=$(cat ${VERSIONDIR}/base)
 fi
 
+LOCKED_BASE=
+if [ -f ${VERSIONDIR}/base.lock ]; then
+	LOCKED_BASE=1
+fi
+
+LOCKED_PKGS=
+if [ -f ${VERSIONDIR}/core.lock ]; then
+	LOCKED_PKGS=1
+fi
+
 INSTALLED_KERNEL=
 if [ -f ${VERSIONDIR}/kernel ]; then
 	INSTALLED_KERNEL=$(cat ${VERSIONDIR}/kernel)
+fi
+
+LOCKED_KERNEL=
+if [ -f ${VERSIONDIR}/kernel.lock ]; then
+	LOCKED_KERNEL=1
 fi
 
 kernel_version() {
@@ -83,7 +102,11 @@ mirror_abi()
 	# The first part after ABI is our suffix and
 	# we need all of it to find the correct sets.
 	MIRROR=$(sed -n 's/'"${URL_KEY}"'\"pkg\+\(.*\/${ABI}\/[^\/]*\)\/.*/\1/p' ${ORIGIN})
-	ABI=$(opnsense-verify -a 2> /dev/null)
+	if [ -z "${MIRROR}" ]; then
+		echo "Mirror read failed." >&2
+		exit 1
+	fi
+	ABI=$(opnsense-verify -a)
 	if [ -n "${DO_ABI}" ]; then
 		ABI=${DO_ABI#"-a "}
 	fi
@@ -105,13 +128,13 @@ DO_INSECURE=
 DO_RELEASE=
 DO_FLAVOUR=
 DO_UPGRADE=
-DO_VERSION=
+DO_VERBOSE=
 DO_KERNEL=
-DO_DEBUG=
+DO_UNLOCK=
 DO_LOCAL=
+DO_LOCK=
 DO_FORCE=
 DO_CHECK=
-DO_HIDE=
 DO_BASE=
 DO_PKGS=
 DO_SKIP=
@@ -119,7 +142,7 @@ DO_SIZE=
 DO_TYPE=
 DO_ABI=
 
-while getopts a:Bbcdefghikl:Mm:N:n:Ppr:Sst:uv OPT; do
+while getopts a:BbcdefikLl:Mm:N:n:Ppr:Sst:TUuvV OPT; do
 	case ${OPT} in
 	a)
 		DO_ABI="-a ${OPTARG}"
@@ -139,23 +162,20 @@ while getopts a:Bbcdefghikl:Mm:N:n:Ppr:Sst:uv OPT; do
 	d)
 		DO_DEFAULTS="-d"
 		;;
-	g)
-		DO_DEBUG="-dbg"
-		;;
 	e)
 		empty_cache
 		;;
 	f)
 		DO_FORCE="-f"
 		;;
-	h)
-		DO_HIDE="-h"
-		;;
 	i)
 		DO_INSECURE="-i"
 		;;
 	k)
 		DO_KERNEL="-k"
+		;;
+	L)
+		DO_LOCK="-L"
 		;;
 	l)
 		DO_LOCAL="-l ${OPTARG}"
@@ -199,11 +219,21 @@ while getopts a:Bbcdefghikl:Mm:N:n:Ppr:Sst:uv OPT; do
 	t)
 		DO_TYPE="-t ${OPTARG}"
 		;;
+	T)
+		DO_TYPE="-T"
+		;;
+	U)
+		DO_UNLOCK="-U"
+		;;
 	u)
 		DO_UPGRADE="-u"
 		;;
+	V)
+		DO_VERBOSE="-V"
+		;;
 	v)
-		DO_VERSION="-v"
+		echo ${VERSION}
+		exit 0
 		;;
 	*)
 		echo "Usage: man opnsense-update" >&2
@@ -219,23 +249,84 @@ if [ -n "${*}" ]; then
 	exit 1
 fi
 
-if [ -n "${DO_VERSION}" ]; then
-	if [ -n "${DO_BASE}" ]; then
-		echo ${INSTALLED_BASE}
-	elif [ -n "${DO_KERNEL}" ]; then
-		echo ${INSTALLED_KERNEL}
-	else
-		echo ${VERSION}-${ARCH}
+if [ -n "${DO_VERBOSE}" ]; then
+	set -x
+fi
+
+if [ "${DO_TYPE}" = "-T" ]; then
+	if [ -n "${DO_BASE}" -a -n "${LOCKED_BASE}" ]; then
+		exit 1
+	elif [ -n "${DO_KERNEL}" -a -n "${LOCKED_KERNEL}" ]; then
+		exit 1
+	elif [ -n "${DO_PKGS}" -a -n "${LOCKED_PKGS}" ]; then
+		exit 1
 	fi
 	exit 0
 fi
 
+if [ -z "${DO_TYPE}${DO_KERNEL}${DO_BASE}${DO_PKGS}" ]; then
+	# default is enable all
+	DO_KERNEL="-k"
+	DO_BASE="-b"
+	DO_PKGS="-p"
+fi
+
+if [ -n "${DO_LOCK}" ]; then
+	mkdir -p ${VERSIONDIR}
+	if [ -n "${DO_KERNEL}" ]; then
+		touch ${VERSIONDIR}/kernel.lock
+	fi
+	if [ -n "${DO_BASE}" ]; then
+		touch ${VERSIONDIR}/base.lock
+	fi
+	if [ -n "${DO_PKGS}" ]; then
+		touch ${VERSIONDIR}/core.lock
+	fi
+	exit 0
+elif [ -n "${DO_UNLOCK}" ]; then
+	if [ -n "${DO_KERNEL}" ]; then
+		rm -f ${VERSIONDIR}/kernel.lock
+	fi
+	if [ -n "${DO_BASE}" ]; then
+		rm -f ${VERSIONDIR}/base.lock
+	fi
+	if [ -n "${DO_PKGS}" ]; then
+		rm -f ${VERSIONDIR}/core.lock
+	fi
+	exit 0
+fi
+
+# DO_CHECK is not included, must be forced because we need both modes
+if [ -z "${DO_FORCE}${DO_SIZE}" ]; then
+	# disable kernel if locked
+	if [ -n "${DO_KERNEL}" -a -n "${LOCKED_KERNEL}" -a \
+	    -z "${DO_UPGRADE}" ]; then
+		echo "Kernel locked at ${INSTALLED_KERNEL}, skipping."
+		DO_KERNEL=
+	fi
+
+	# disable base if locked
+	if [ -n "${DO_BASE}" -a -n "${LOCKED_BASE}" -a \
+	    -z "${DO_UPGRADE}" ]; then
+		echo "Base locked at ${INSTALLED_BASE}, skipping."
+		DO_BASE=
+	fi
+
+	# disable packages if locked
+	if [ -n "${DO_PKGS}" -a -n "${LOCKED_PKGS}" -a \
+	    -z "${DO_UPGRADE}" ]; then
+		echo "Packages locked, skipping."
+		DO_PKGS=
+		DO_TYPE=
+	fi
+fi
+
 if [ -n "${DO_TYPE}" ]; then
-	OLD=$(cat /usr/local/opnsense/version/opnsense.name)
+	OLD=$(opnsense-version -n)
 	NEW=${DO_TYPE#"-t "}
 
 	if [ "${OLD}" = "${NEW}" -a -z "${DO_FORCE}" ]; then
-		echo "The package type '${OLD}' is already installed."
+		echo "The package '${OLD}' is already installed."
 	else
 		# cache packages in case something goes wrong
 		${PKG} fetch -y ${OLD} ${NEW}
@@ -261,21 +352,14 @@ if [ -n "${DO_TYPE}" ]; then
 	fi
 fi
 
-if [ -z "${DO_TYPE}${DO_KERNEL}${DO_BASE}${DO_PKGS}" ]; then
-	# default is enable all
-	DO_KERNEL="-k"
-	DO_BASE="-b"
-	DO_PKGS="-p"
-fi
-
 if [ -n "${DO_CHECK}" ]; then
 	if [ -n "${DO_KERNEL}" ]; then
-		if [ "${VERSION}-${ARCH}" != "${INSTALLED_KERNEL}" ]; then
+		if [ "${VERSION}" != "${INSTALLED_KERNEL}" ]; then
 			exit 0
 		fi
 	fi
 	if [ -n "${DO_BASE}" ]; then
-		if [ "${VERSION}-${ARCH}" != "${INSTALLED_BASE}" ]; then
+		if [ "${VERSION}" != "${INSTALLED_BASE}" ]; then
 			exit 0
 		fi
 	fi
@@ -284,7 +368,7 @@ if [ -n "${DO_CHECK}" ]; then
 fi
 
 if [ -n "${DO_DEFAULTS}" ]; then
-	# restore origin.conf before potential replace
+	# restore default before potential replace
 	cp ${ORIGIN}.sample ${ORIGIN}
 fi
 
@@ -353,8 +437,7 @@ if [ "${DO_PKGS}" = "-p" -a -z "${DO_UPGRADE}${DO_SIZE}" ]; then
 		# script may have changed, relaunch...
 		opnsense-update ${DO_BASE} ${DO_KERNEL} ${DO_LOCAL} \
 		    ${DO_FORCE} ${DO_RELEASE} ${DO_DEFAULTS} \
-		    ${DO_MIRRORDIR} ${DO_MIRRORURL} ${DO_HIDE} \
-		    ${DO_ABI}
+		    ${DO_MIRRORDIR} ${DO_MIRRORURL} ${DO_ABI}
 	fi
 
 	# stop here to prevent the second pass
@@ -369,21 +452,20 @@ elif [ -f ${OPENSSL} ]; then
 fi
 
 PACKAGESSET=packages-${RELEASE}-${FLAVOUR}-${ARCH}.tar
-KERNELSET=kernel${DO_DEBUG}-${RELEASE}-${ARCH}.txz
-OBSOLETESET=base-${RELEASE}-${ARCH}.obsolete
+KERNELSET=kernel-${RELEASE}-${ARCH}.txz
 BASESET=base-${RELEASE}-${ARCH}.txz
 
 MIRROR="$(mirror_abi)/sets"
 
 if [ -n "${DO_SIZE}" ]; then
-	KERNEL_SIZE=$(fetch -s ${MIRROR}/${KERNELSET} 2> /dev/null)
-	PKGS_SIZE=$(fetch -s ${MIRROR}/${PACKAGESSET} 2> /dev/null)
-	BASE_SIZE=$(fetch -s ${MIRROR}/${BASESET} 2> /dev/null)
 	if [ -n "${DO_BASE}" ]; then
+		BASE_SIZE=$(fetch -s ${MIRROR}/${BASESET} 2> /dev/null)
 		echo ${BASE_SIZE}
 	elif [ -n "${DO_KERNEL}" ]; then
+		KERNEL_SIZE=$(fetch -s ${MIRROR}/${KERNELSET} 2> /dev/null)
 		echo ${KERNEL_SIZE}
 	elif [ -n "${DO_PKGS}" ]; then
+		PKGS_SIZE=$(fetch -s ${MIRROR}/${PACKAGESSET} 2> /dev/null)
 		echo ${PKGS_SIZE}
 	fi
 	exit 0
@@ -391,14 +473,12 @@ fi
 
 if [ -z "${DO_FORCE}" ]; then
 	# disable kernel update if up-to-date
-	if [ "${RELEASE}-${ARCH}" = "${INSTALLED_KERNEL}" -a \
-	    -n "${DO_KERNEL}" ]; then
+	if [ "${RELEASE}" = "${INSTALLED_KERNEL}" -a -n "${DO_KERNEL}" ]; then
 		DO_KERNEL=
 	fi
 
 	# disable base update if up-to-date
-	if [ "${RELEASE}-${ARCH}" = "${INSTALLED_BASE}" -a \
-	    -n "${DO_BASE}" ]; then
+	if [ "${RELEASE}" = "${INSTALLED_BASE}" -a -n "${DO_BASE}" ]; then
 		DO_BASE=
 	fi
 
@@ -408,6 +488,15 @@ if [ -z "${DO_FORCE}" ]; then
 		exit 0
 	fi
 fi
+
+exit_msg()
+{
+	if [ -n "${1}" ]; then
+		echo "${1}"
+	fi
+
+	exit 1
+}
 
 fetch_set()
 {
@@ -429,11 +518,30 @@ fetch_set()
 
 	echo -n "Fetching ${1}: ."
 
-	mkdir -p ${WORKDIR} && ${STAGE1} && ${STAGE2} && \
-	    ${STAGE3} && echo " done" && return
+	if ! mkdir -p ${WORKDIR}; then
+		exit_msg " failed, mkdir error ${?}"
+	fi
 
-	echo " failed"
-	exit 1
+	if ! ${STAGE1}; then
+		exit_msg " failed, no signature found"
+	fi
+
+	if ! ${STAGE2}; then
+		exit_msg " failed, no update found"
+	fi
+
+	if [ -n "${DO_VERBOSE}" ]; then
+		if ! ${STAGE3}; then
+			# message did print already
+			exit_msg
+		fi
+	else
+		if ! ${STAGE3} 2> /dev/null; then
+			exit_msg " failed, signature invalid"
+		fi
+	fi
+
+	echo " done"
 }
 
 install_kernel()
@@ -446,14 +554,27 @@ install_kernel()
 
 	echo -n "Installing ${KERNELSET}..."
 
-	mkdir -p ${KERNELDIR} ${KERNELDIR}.old ${DEBUGDIR}${KERNELDIR} && \
-	    rm -r ${KERNELDIR}.old ${DEBUGDIR}${KERNELDIR} && \
-	    mv ${KERNELDIR} ${KERNELDIR}.old && \
-	    tar -C/ -xpf ${WORKDIR}/${KERNELSET} && \
-	    ${KLDXREF} && echo " done" && return
+	if ! mkdir -p ${KERNELDIR} ${KERNELDIR}.old ${DEBUGDIR}${KERNELDIR}; then
+		exit_msg " failed, mkdir error ${?}"
+	fi
 
-	echo " failed"
-	exit 1
+	if ! rm -r ${KERNELDIR}.old ${DEBUGDIR}${KERNELDIR}; then
+		exit_msg " failed, rm error ${?}"
+	fi
+
+	if ! mv ${KERNELDIR} ${KERNELDIR}.old; then
+		exit_msg " failed, mv error ${?}"
+	fi
+
+	if ! tar -C / -xpf ${WORKDIR}/${KERNELSET}; then
+		exit_msg " failed, tar error ${?}"
+	fi
+
+	if ! ${KLDXREF}; then
+		exit_msg " failed, kldxref error ${?}"
+	fi
+
+	echo " done"
 }
 
 install_base()
@@ -462,30 +583,43 @@ install_base()
 
 	echo -n "Installing ${BASESET}..."
 
-	mkdir -p ${NOSCHGDIRS} && \
-	    chflags -R noschg ${NOSCHGDIRS} && \
-	    tar -C/ -xpf ${WORKDIR}/${BASESET} \
-	    --exclude="./etc/group" \
-	    --exclude="./etc/master.passwd" \
-	    --exclude="./etc/passwd" \
-	    --exclude="./etc/shells" \
-	    --exclude="./etc/ttys" \
-	    --exclude="./etc/rc" \
-	    --exclude="./etc/rc.shutdown" && \
-	    kldxref ${KERNELDIR} && \
-	    echo " done" && return
+	if ! mkdir -p ${NOSCHGDIRS}; then
+		exit_msg " failed, mkdir error ${?}"
+	fi
 
-	echo " failed"
-	exit 1
-}
+	if ! chflags -R noschg ${NOSCHGDIRS}; then
+		exit_msg " failed, chflags error ${?}"
+	fi
 
-install_obsolete()
-{
-	echo -n "Installing ${OBSOLETESET}..."
+	if ! tar -C / -xpf ${WORKDIR}/${BASESET} \
+	    --exclude="^etc/group" \
+	    --exclude="^etc/master.passwd" \
+	    --exclude="^etc/motd" \
+	    --exclude="^etc/passwd" \
+	    --exclude="^etc/pwd.db" \
+	    --exclude="^etc/rc" \
+	    --exclude="^etc/rc.shutdown" \
+	    --exclude="^etc/shells" \
+	    --exclude="^etc/spwd.db" \
+	    --exclude="^etc/ttys" \
+	    --exclude="^proc" \
+	    --exclude="^var/cache/pkg" \
+	    --exclude="^var/crash" \
+	    --exclude="^var/db/pkg"; then
+		exit_msg " failed, tar error ${?}"
+	fi
+
+	if ! kldxref ${KERNELDIR}; then
+		exit_msg " failed, kldxref error ${?}"
+	fi
+
+	if [ ! -f ${VERSIONDIR}/base.obsolete ]; then
+		exit_msg " failed, no base.obsolete found"
+	fi
 
 	while read FILE; do
 		rm -f ${FILE}
-	done < ${WORKDIR}/${OBSOLETESET}
+	done < ${VERSIONDIR}/base.obsolete
 
 	echo " done"
 }
@@ -506,24 +640,44 @@ install_pkgs()
 		sed -i '' '/'"${SIG_KEY}"'/s/\"fingerprints\"/\"none\"/' ${ORIGIN}
 	fi
 
+	# prepare log file and pipe
+	mkdir -p ${WORKPREFIX}
+	: > ${LOGFILE}
+	rm -f ${PIPEFILE}
+	mkfifo ${PIPEFILE}
+
+	# unlock all to avoid dependency stalls
+	${TEE} ${LOGFILE} < ${PIPEFILE} &
+	${PKG} unlock -ay 2>&1 > ${PIPEFILE}
+
 	# run full upgrade from the local repository
-	${PKG} unlock -ay
-	if ${PKG} upgrade -fy; then
-		${PKG} autoremove -y
-		${PKG} clean -ya
+	${TEE} ${LOGFILE} < ${PIPEFILE} &
+	if ${PKG} upgrade -fy -r ${PRODUCT} 2>&1 > ${PIPEFILE}; then
+		${TEE} ${LOGFILE} < ${PIPEFILE} &
+		${PKG} autoremove -y 2>&1 > ${PIPEFILE}
+		${TEE} ${LOGFILE} < ${PIPEFILE} &
+		${PKG} clean -ya 2>&1 > ${PIPEFILE}
 	fi
 }
 
 if [ "${DO_PKGS}" = "-p" ]; then
+	if [ -z "${DO_FORCE}" -o -n "${DO_UPGRADE}" ]; then
+		rm -f ${VERSIONDIR}/core.lock
+	fi
 	fetch_set ${PACKAGESSET}
 fi
 
 if [ "${DO_BASE}" = "-b" ]; then
-	fetch_set ${OBSOLETESET}
+	if [ -z "${DO_FORCE}" -o -n "${DO_UPGRADE}" ]; then
+		rm -f ${VERSIONDIR}/base.lock
+	fi
 	fetch_set ${BASESET}
 fi
 
 if [ "${DO_KERNEL}" = "-k" ]; then
+	if [ -z "${DO_FORCE}" -o -n "${DO_UPGRADE}" ]; then
+		rm -f ${VERSIONDIR}/kernel.lock
+	fi
 	fetch_set ${KERNELSET}
 fi
 
@@ -568,11 +722,6 @@ if [ "${DO_BASE}" = "-b" -a -n "${DO_UPGRADE}" ]; then
 	# push pending base update to deferred
 	mv ${WORKDIR}/${BASESET} ${PENDINGDIR}
 
-	echo " done"
-	echo -n "Extracting ${OBSOLETESET}..."
-
-        mv ${WORKDIR}/${OBSOLETESET} ${PENDINGDIR}
-
 	# add action marker for next run
 	echo ${RELEASE} > "${WORKPREFIX}/.base.pending"
 
@@ -607,7 +756,6 @@ if [ -n "${DO_BASE}" -a -z "${DO_UPGRADE}" ]; then
 	fi
 
 	install_base
-	install_obsolete
 
 	# clean up deferred sets that could be there
 	rm -rf ${PENDINGDIR}/base-*
@@ -618,19 +766,6 @@ if [ "${DO_PKGS}" = "-P" -a -z "${DO_UPGRADE}" ]; then
 
 	# clean up deferred sets that could be there
 	rm -rf ${PENDINGDIR}/packages-*
-fi
-
-if [ -n "${DO_HIDE}" ]; then
-	# hide the version info in case it was requested
-	mkdir -p ${VERSIONDIR}
-
-	if [ -n "${DO_KERNEL}" ]; then
-		echo ${VERSION}-${ARCH} > ${VERSIONDIR}/kernel
-	fi
-
-	if [ -n "${DO_BASE}" -a -z "${DO_UPGRADE}" ]; then
-		echo ${VERSION}-${ARCH} > ${VERSIONDIR}/base
-	fi
 fi
 
 if [ -z "${DO_LOCAL}" ]; then

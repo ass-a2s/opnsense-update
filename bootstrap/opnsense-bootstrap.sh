@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright (c) 2015-2017 Franco Fichtner <franco@opnsense.org>
+# Copyright (c) 2015-2019 Franco Fichtner <franco@opnsense.org>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -28,10 +28,10 @@
 set -e
 
 URL="https://github.com/opnsense/core/archive/stable"
-WORKPREFIX="/tmp/opnsense-bootstrap"
+WORKDIR="/tmp/opnsense-bootstrap"
 FLAVOUR="OpenSSL"
 TYPE="opnsense"
-RELEASE="17.7"
+RELEASE="19.1"
 
 DO_BARE=
 DO_INSECURE=
@@ -47,7 +47,7 @@ while getopts bfin:r:t:vy OPT; do
 		DO_FACTORY="-f"
 		;;
 	i)
-		DO_INSECURE="--no-verify-peer"
+		DO_INSECURE="-i"
 		;;
 	n)
 		FLAVOUR=${OPTARG}
@@ -117,21 +117,60 @@ if [ -z "${DO_YES}" ]; then
 	esac
 fi
 
+if [ -n "${DO_FACTORY}" ]; then
+	if [ -z "${DO_YES}" ]; then
+		echo
+		echo -n "Factory reset mode selected, are you sure? [y/N]: "
+
+		read YN
+		case ${YN} in
+		[yY])
+			;;
+		*)
+			exit 0
+			;;
+		esac
+	fi
+fi
+
+if [ -n "${DO_INSECURE}" ]; then
+	if [ -z "${DO_YES}" ]; then
+		echo
+		echo -n "Insecure mode selected, are you sure? [y/N]: "
+
+		read YN
+		case ${YN} in
+		[yY])
+			;;
+		*)
+			exit 0
+			;;
+		esac
+	fi
+fi
+
 echo
 
 rm -rf /usr/local/etc/pkg
 
+rm -rf ${WORKDIR}/*
+mkdir -p ${WORKDIR}
+
 export ASSUME_ALWAYS_YES=yes
 
-if [ -z "${DO_INSECURE}" ]; then
+if [ -n "${DO_INSECURE}" ]; then
+	# no CA file around to verify against, user choice
+	export SSL_NO_VERIFY_PEER=yes
+else
 	pkg bootstrap -f
 	pkg install ca_root_nss
+
+	# save a copy of the CA file to use for the bootstrap
+	cp /etc/ssl/cert.pem ${WORKDIR}/cert.pem
+	export SSL_CA_CERT_FILE=${WORKDIR}/cert.pem
 fi
 
-WORKDIR=${WORKPREFIX}/${$}
-
-mkdir -p ${WORKDIR}
-fetch ${DO_INSECURE} -o ${WORKDIR}/core.tar.gz "${URL}/${RELEASE}.tar.gz"
+fetch -o ${WORKDIR}/core.tar.gz "${URL}/${RELEASE}.tar.gz"
 tar -C ${WORKDIR} -xf ${WORKDIR}/core.tar.gz
 
 if [ -z "${DO_BARE}" ]; then
@@ -145,8 +184,6 @@ fi
 make -C ${WORKDIR}/core-stable-${RELEASE} \
     bootstrap DESTDIR= FLAVOUR=${FLAVOUR}
 
-rm -rf ${WORKPREFIX}/*
-
 if [ -z "${DO_BARE}" ]; then
 	if [ -n "${DO_FACTORY}" ]; then
 		rm -rf /conf/*
@@ -154,6 +191,11 @@ if [ -z "${DO_BARE}" ]; then
 
 	pkg bootstrap
 	pkg install ${TYPE}
+
+	# beyond this point verify everything
+	unset SSL_NO_VERIFY_PEER
+	unset SSL_CA_CERT_FILE
+
 	opnsense-update -bkf
 	reboot
 fi

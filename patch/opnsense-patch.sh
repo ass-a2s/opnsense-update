@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright (c) 2016-2017 Franco Fichtner <franco@opnsense.org>
+# Copyright (c) 2016-2019 Franco Fichtner <franco@opnsense.org>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -28,9 +28,11 @@
 set -e
 
 # internal vars
-WORKDIR="/tmp/opnsense-patch"
+ARGS=
+CACHEDIR="/var/cache/opnsense-patch"
+PATCHES=
 PREFIX="/usr/local"
-INSECURE=
+REFRESH="/usr/local/opnsense/www/index.php"
 
 # fetch defaults
 SITE="https://github.com"
@@ -38,12 +40,19 @@ ACCOUNT="opnsense"
 REPOSITORY="core"
 PATCHLEVEL="2"
 
+# user options
+DO_FORCE=
+DO_FORWARD="-t"
+DO_DOWNLOAD=
+DO_INSECURE=
+DO_LIST=
+
 if [ "$(id -u)" != "0" ]; then
-	echo "Must be root."
+	echo "Must be root." >&2
 	exit 1
 fi
 
-while getopts a:c:ip:r:s: OPT; do
+while getopts a:c:defilNp:r:s: OPT; do
 	case ${OPT} in
 	a)
 		ACCOUNT=${OPTARG}
@@ -64,8 +73,23 @@ while getopts a:c:ip:r:s: OPT; do
 			;;
 		esac
 		;;
+	d)
+		DO_DOWNLOAD="-d"
+		;;
+	e)
+		rm -rf ${CACHEDIR}/*
+		;;
+	f)
+		DO_FORCE="-f"
+		;;
 	i)
-		INSECURE="--no-verify-peer"
+		DO_INSECURE="--no-verify-peer"
+		;;
+	l)
+		DO_LIST="-l"
+		;;
+	N)
+		DO_FORWARD="-f"
 		;;
 	p)
 		PATCHLEVEL=${OPTARG}
@@ -77,7 +101,7 @@ while getopts a:c:ip:r:s: OPT; do
 		SITE=${OPTARG}
 		;;
 	*)
-		echo "Usage: opnsense-patch [-c repo_default] commit_hash ..." >&2
+		echo "Usage: man opnsense-patch" >&2
 		exit 1
 		;;
 	esac
@@ -85,20 +109,141 @@ done
 
 shift $((${OPTIND} - 1))
 
-mkdir -p ${WORKDIR}
+if [ ${PATCHLEVEL} -lt 2 ]; then
+	echo "Patch level must be >= 2." >&2
+	exit 1
+fi
+
+mkdir -p ${CACHEDIR}
+
+patch_load()
+{
+	for PATCH in $(find ${CACHEDIR}/ -name "${REPOSITORY}-*"); do
+		if [ ! -s "${PATCH}" ]; then
+			rm -f "${PATCH}"
+			continue
+		fi
+
+		HASH=$(grep '^From [0-9a-f]' ${PATCH} | cut -d ' ' -f 2)
+		SUBJECT=$(grep '^Subject: \[PATCH\]' ${PATCH} | cut -d ' ' -f 3-)
+		FILE=$(basename ${PATCH})
+
+		if [ -z "${HASH}" -o -z "${SUBJECT}" ]; then
+			rm -f "${PATCH}"
+			continue
+		fi
+
+		echo ${FILE} ${HASH} ${SUBJECT}
+	done
+}
+
+PATCHES=$(patch_load)
+
+patch_found()
+{
+	ARG=${1}
+	ARGLEN=$(echo -n ${ARG} | wc -c | awk '{ print $1 }')
+
+	echo "${PATCHES}" | while read FILE HASH SUBJECT; do
+		if [ "$(echo ${HASH} | cut -c -${ARGLEN})" = ${ARG} ]; then
+			echo ${FILE}
+			return
+		fi
+	done
+}
+
+patch_print()
+{
+	echo "${PATCHES}" | while read FILE HASH SUBJECT; do
+		if [ -z "${FILE}" ]; then
+			continue
+		fi
+		LINE="$(echo ${HASH} | cut -c -11)"
+		LINE="${LINE} $(echo ${SUBJECT} | cut -c -50)"
+		echo ${LINE}
+	done
+}
+
+if [ -n "${DO_LIST}" ]; then
+	patch_print
+	exit 0
+fi
 
 for ARG in ${@}; do
-	fetch ${INSECURE} -q \
-	    "${SITE}/${ACCOUNT}/${REPOSITORY}/commit/${ARG}.patch" \
-	    -o "${WORKDIR}/${ARG}.patch"
+	FOUND="$(patch_found ${ARG})"
+
+	if [ -n "${FOUND}" ]; then
+		if [ -n "${DO_FORCE}" ]; then
+			rm ${CACHEDIR}/${FOUND}
+		else
+			echo "Found local copy of ${ARG}, skipping fetch."
+			ARGS="${ARGS} ${FOUND}"
+			continue
+		fi
+	fi
+
+	WANT="${REPOSITORY}-${ARG}"
+
+	fetch ${DO_INSECURE} -q -o "${CACHEDIR}/~${WANT}" \
+	    "${SITE}/${ACCOUNT}/${REPOSITORY}/commit/${ARG}.patch"
+
+	if [ ! -s "${CACHEDIR}/~${WANT}" ]; then
+		rm -f "${CACHEDIR}/~${WANT}"
+		echo "Failed to fetch: ${ARG}" >&2
+		exit 1
+	fi
+
+	DISCARD=
+
+	while IFS= read -r PATCHLINE; do
+		case "${PATCHLINE}" in
+		"diff --git a/"*" b/"*)
+			PATCHFILE="$(echo "${PATCHLINE}" | awk '{print $4 }')"
+			for INDEX in $(seq 2 ${PATCHLEVEL}); do
+				PATCHFILE=${PATCHFILE#*/}
+			done
+			if [ -n "${PATCHFILE##src/*}" ]; then
+				DISCARD=1
+			else
+				DISCARD=
+			fi
+			;;
+		esac
+
+		if [ -n "${DISCARD}" ]; then
+			continue
+		fi
+
+		echo "${PATCHLINE}" >> "${CACHEDIR}/${WANT}"
+	done < "${CACHEDIR}/~${WANT}"
+
+	echo "Fetched ${ARG} via ${SITE}/${ACCOUNT}/${REPOSITORY}"
+
+	ARGS="${ARGS} ${WANT}"
 done
 
-for ARG in ${@}; do
-	patch -Et -p ${PATCHLEVEL} -d "${PREFIX}" -i "${WORKDIR}/${ARG}.patch"
-	cat "${WORKDIR}/${ARG}.patch" | while read PATCHLINE; do
+rm -f ${CACHEDIR}/~*
+
+if [ -n "${DO_DOWNLOAD}" ]; then
+	ARGS=
+fi
+
+for ARG in ${ARGS}; do
+	# XXX from here we could figure out if we will run in reverse...
+	if ! patch ${DO_FORWARD} -sCE -p ${PATCHLEVEL} -d "${PREFIX}" -i "${CACHEDIR}/${ARG}"; then
+		exit 1
+	fi
+
+	patch ${DO_FORWARD} -E -p ${PATCHLEVEL} -d "${PREFIX}" -i "${CACHEDIR}/${ARG}"
+
+	while IFS= read -r PATCHLINE; do
 		case "${PATCHLINE}" in
-		"diff --git "*" b/src/"*)
-			PATCHFILE="${PREFIX}/$(echo "${PATCHLINE}" | awk '{print $4 }' | cut -c 7-)"
+		"diff --git a/"*" b/"*)
+			PATCHFILE="$(echo "${PATCHLINE}" | awk '{print $4 }')"
+			for INDEX in $(seq 1 ${PATCHLEVEL}); do
+				PATCHFILE=${PATCHFILE#*/}
+			done
+			PATCHFILE="${PREFIX}/${PATCHFILE}"
 			;;
 		"new file mode "*)
 			PATCHMODE=$(echo "${PATCHLINE}" | awk '{print $4 }' | cut -c 4-6)
@@ -118,9 +263,14 @@ for ARG in ${@}; do
 			fi
 			;;
 		esac
-	done
+	done < "${CACHEDIR}/${ARG}"
 done
 
-rm -rf ${WORKDIR}/*
+if [ -n "${ARGS}" ]; then
+	echo "All patches have been applied successfully.  Have a nice day."
+fi
 
-echo "All patches have been applied successfully.  Have a nice day."
+if [ -f ${REFRESH} ]; then
+	# always force browser to reload JS/CSS
+	touch ${REFRESH}
+fi

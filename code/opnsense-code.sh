@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright (c) 2016-2017 Franco Fichtner <franco@opnsense.org>
+# Copyright (c) 2016-2018 Franco Fichtner <franco@opnsense.org>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -83,8 +83,8 @@ for ARG in ${@}; do
 		rm -rf "${DIRECTORY}/${ARG}"
 	fi
 
-	if [ -d "${DIRECTORY}/${ARG}" ]; then
-		(cd "${DIRECTORY}/${ARG}"; git pull)
+	if [ -d "${DIRECTORY}/${ARG}/.git" ]; then
+		(cd "${DIRECTORY}/${ARG}"; git fetch --all --prune; git pull)
 	else
 		git clone ${SITE}/${ACCOUNT}/${ARG} "${DIRECTORY}/${ARG}"
 	fi
@@ -95,9 +95,12 @@ for ARG in ${@}; do
 			touch /etc/make.conf
 		fi
 		rm /etc/make.conf
-		SETTINGS=$(make -C "${DIRECTORY}/${ARG}" -VSETTINGS)
-		ln -s "${DIRECTORY}/${ARG}/config/${SETTINGS}/make.conf" \
-		    /etc/make.conf
+		CONF="${DIRECTORY}/${ARG}/config/$(opnsense-version -a)/make.conf"
+		if [ ! -f "${CONF}" ]; then
+			SETTINGS=$(make -C "${DIRECTORY}/${ARG}" -VSETTINGS)
+			CONF="${DIRECTORY}/${ARG}/config/${SETTINGS}/make.conf"
+		fi
+		ln -s "${CONF}" /etc/make.conf
 		;;
 	*)
 		;;

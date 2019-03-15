@@ -33,14 +33,11 @@ It will automatically pick up the latest available version and
 build a chain of trust by using current package fingerprints -> CA
 root certificates -> HTTPS -> OPNsense package fingerprints.
 
-What it will also do is turn a supported stock FreeBSD 11 release into
+What it will also do is turn a supported stock FreeBSD release into
 an OPNsense installation, given that UFS was used to install the
 root file system.
 
-What it will likely do at some point in the future is moving an
-installation from FreeBSD/OPNsense to HardenedBSD/OPNsense or back.
-
-The usage is simple, starting with a FreeBSD 11.0-RELEASE image:
+The usage is simple, starting with a FreeBSD 11.2-RELEASE image:
 
     # pkg install ca_root_nss
     # fetch https://raw.githubusercontent.com/opnsense/update/master/bootstrap/opnsense-bootstrap.sh
@@ -50,8 +47,8 @@ After successful reboot, OPNsense should be up and running.  :)
 
 The utility was first introduced in November 2015.
 
-opnsense-sign && opnsense-verify
-================================
+opnsense-sign, opnsense-verify
+==============================
 
 opnsense-sign(8) and opnsense-verify(8) sign and verify arbitrary
 files using signature verification methods available by pkg(8),
@@ -75,12 +72,13 @@ The utility was first introduced in April 2016.
 opnsense-patch
 ==============
 
-opnsense-patch(8) applies upstream git patches in the order that they
+opnsense-patch(8) applies upstream git(1) patches in the order that they
 have been given.  This helps to deploy fixes faster without the need
 to run manual edits or file downloads since patch(1) tries to keep the
 file integrity intact.
 
-The utility was first introduced in May 2016.
+The utility was first introduced in May 2016.  In February 2019, a local
+caching mechanism was added to provide offline patching capability.
 
 opnsense-code
 =============
